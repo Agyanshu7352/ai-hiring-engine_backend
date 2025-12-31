@@ -21,30 +21,57 @@ const app = express();
 // Connect to database
 connectDB();
 
-// Middleware
+// ==================== CORS CONFIGURATION ====================
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
+  'http://localhost:5000',
+  'https://ai-hiring-engine-frontend.vercel.app', // ADD THIS LINE
   process.env.CLIENT_URL,        
 ].filter(Boolean);
 
+console.log('🌐 Allowed CORS origins:', allowedOrigins);
+
+// CORS middleware
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
+    console.log('📨 Request from origin:', origin);
+    
+    // Allow requests with no origin (mobile apps, Postman, curl)
+    if (!origin) {
+      return callback(null, true);
+    }
+    
+    if (allowedOrigins.includes(origin)) {
+      console.log('✅ Origin allowed:', origin);
       callback(null, true);
     } else {
-      callback(new Error('CORS not allowed'));
+      console.log('❌ Origin blocked:', origin);
+      callback(new Error('Not allowed by CORS'));
     }
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Handle preflight requests
+app.options('*', cors());
+
+// Body parsing middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Request logging
+app.use((req, res, next) => {
+  console.log(`📍 ${req.method} ${req.path}`);
+  next();
+});
 
 // Static files (for uploaded resumes)
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
-// Routes
+// ==================== ROUTES ====================
 app.use('/api/auth', authRoutes);
 app.use('/api', resumeRoutes);
 app.use('/api', jdRoutes);
@@ -56,7 +83,12 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     service: 'AI Hiring Engine Backend',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    cors: {
+      enabled: true,
+      allowedOrigins: allowedOrigins
+    },
+    mlService: process.env.ML_SERVICE_URL ? 'configured' : 'not configured'
   });
 });
 
@@ -86,7 +118,7 @@ app.use((req, res) => {
   });
 });
 
-// Start server
+// ==================== START SERVER ====================
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`
@@ -95,21 +127,23 @@ const server = app.listen(PORT, () => {
 ║   Running on port ${PORT}                    ║
 ║   Environment: ${process.env.NODE_ENV || 'development'}              ║
 ║   Time: ${new Date().toLocaleString()}     ║
+║   CORS: Enabled for ${allowedOrigins.length} origins   ║
 ╚═══════════════════════════════════════════╝
   `);
+  console.log('✅ Allowed origins:', allowedOrigins);
 });
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (err) => {
-  console.error(`Unhandled Rejection: ${err.message}`);
+  console.error(`❌ Unhandled Rejection: ${err.message}`);
   server.close(() => process.exit(1));
 });
 
 // Handle SIGTERM
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
+  console.log('⚠️  SIGTERM received. Shutting down gracefully...');
   server.close(() => {
-    console.log('Process terminated');
+    console.log('✅ Process terminated');
   });
 });
 
