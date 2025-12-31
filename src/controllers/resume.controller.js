@@ -1,7 +1,9 @@
 const axios = require('axios');
 const Resume = require('../models/Resume');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
+const FormData = require('form-data');
 
 // @desc    Parse and upload resume
 // @route   POST /api/parse-resume
@@ -16,24 +18,50 @@ exports.parseResume = async (req, res) => {
     }
 
     console.log('File uploaded:', req.file.filename);
-    
-    // Get absolute path
-    const absolutePath = path.resolve(req.file.path);
-    console.log('Absolute file path:', absolutePath);
+    console.log('File path:', req.file.path);
+    console.log('ML Service URL:', process.env.ML_SERVICE_URL);
 
-    // Send to ML service for parsing
+    // Check if ML service URL is configured
+    if (!process.env.ML_SERVICE_URL) {
+      throw new Error('ML_SERVICE_URL is not configured');
+    }
+
+    // Verify file exists
+    if (!fsSync.existsSync(req.file.path)) {
+      throw new Error('Uploaded file not found');
+    }
+
+    const formData = new FormData();
+    formData.append(
+      'resume',
+      fsSync.createReadStream(req.file.path),
+      {
+        filename: req.file.originalname,
+        contentType: req.file.mimetype
+      }
+    );
+
+    console.log('Sending request to ML service...');
+
     const mlResponse = await axios.post(
       `${process.env.ML_SERVICE_URL}/parse-resume`,
+      formData,
       {
-        filePath: absolutePath,  // Use absolute path
-        fileName: req.file.filename
-      },
-      {
-        timeout: 30000 // 30 second timeout
+        headers: {
+          ...formData.getHeaders()
+        },
+        timeout: 60000, // Increased timeout to 60 seconds
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
       }
     );
 
     console.log('ML service response received');
+
+    // Validate ML response
+    if (!mlResponse.data || !mlResponse.data.parsedData) {
+      throw new Error('Invalid response from ML service');
+    }
 
     // Save to database
     const resume = new Resume({
@@ -42,15 +70,15 @@ exports.parseResume = async (req, res) => {
       filePath: req.file.path,
       fileSize: req.file.size,
       fileType: req.file.mimetype,
-      extractedText: mlResponse.data.extractedText,
-      parsedData: mlResponse.data.parsedData,
+      extractedText: mlResponse.data.extractedText || '',
+      parsedData: mlResponse.data.parsedData || {},
       status: 'parsed'
     });
 
     await resume.save();
-    console.log('Resume saved to database');
+    console.log('Resume saved to database with ID:', resume._id);
 
-    res.json({
+    res.status(200).json({
       success: true,
       resumeId: resume._id,
       data: {
@@ -60,20 +88,36 @@ exports.parseResume = async (req, res) => {
     });
   } catch (error) {
     console.error('Resume parsing error:', error.message);
+    console.error('Error stack:', error.stack);
     
+    // More detailed error logging
+    if (error.response) {
+      console.error('ML Service error response:', {
+        status: error.response.status,
+        data: error.response.data
+      });
+    }
+
     // Clean up uploaded file on error
-    if (req.file) {
+    if (req.file && req.file.path) {
       try {
-        await fs.unlink(req.file.path);
+        if (fsSync.existsSync(req.file.path)) {
+          await fs.unlink(req.file.path);
+          console.log('Cleaned up uploaded file');
+        }
       } catch (unlinkError) {
-        console.error('Error deleting file:', unlinkError);
+        console.error('Error deleting file:', unlinkError.message);
       }
     }
 
-    res.status(500).json({
+    // Send appropriate error response
+    const statusCode = error.response?.status || 500;
+    const errorMessage = error.response?.data?.error || error.message || 'Failed to parse resume';
+
+    res.status(statusCode).json({
       success: false,
       error: 'Failed to parse resume',
-      details: error.message
+      details: errorMessage
     });
   }
 };
@@ -88,16 +132,17 @@ exports.getResumes = async (req, res) => {
       .sort({ createdAt: -1 })
       .select('-extractedText'); // Exclude large text field
 
-    res.json({
+    res.status(200).json({
       success: true,
       count: resumes.length,
-      resumes
+      data: resumes
     });
   } catch (error) {
-    console.error('Get resumes error:', error);
+    console.error('Get resumes error:', error.message);
     res.status(500).json({
       success: false,
-      error: 'Failed to fetch resumes'
+      error: 'Failed to fetch resumes',
+      details: error.message
     });
   }
 };
@@ -116,15 +161,25 @@ exports.getResumeById = async (req, res) => {
       });
     }
 
-    res.json({
+    res.status(200).json({
       success: true,
       data: resume
     });
   } catch (error) {
-    console.error('Get resume error:', error);
+    console.error('Get resume error:', error.message);
+    
+    // Handle invalid ObjectId
+    if (error.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid resume ID format'
+      });
+    }
+
     res.status(500).json({
       success: false,
-      error: 'Failed to fetch resume'
+      error: 'Failed to fetch resume',
+      details: error.message
     });
   }
 };
@@ -143,25 +198,46 @@ exports.deleteResume = async (req, res) => {
       });
     }
 
+    // Check authorization (if user is authenticated)
+    if (req.user && resume.userId && resume.userId.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to delete this resume'
+      });
+    }
+
     // Delete file from filesystem
     try {
-      await fs.unlink(resume.filePath);
+      if (fsSync.existsSync(resume.filePath)) {
+        await fs.unlink(resume.filePath);
+        console.log('File deleted:', resume.filePath);
+      }
     } catch (fileError) {
-      console.error('Error deleting file:', fileError);
+      console.error('Error deleting file:', fileError.message);
     }
 
     // Delete from database
     await resume.deleteOne();
 
-    res.json({
+    res.status(200).json({
       success: true,
       message: 'Resume deleted successfully'
     });
   } catch (error) {
-    console.error('Delete resume error:', error);
+    console.error('Delete resume error:', error.message);
+    
+    // Handle invalid ObjectId
+    if (error.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid resume ID format'
+      });
+    }
+
     res.status(500).json({
       success: false,
-      error: 'Failed to delete resume'
+      error: 'Failed to delete resume',
+      details: error.message
     });
   }
 };
@@ -182,20 +258,38 @@ exports.updateResume = async (req, res) => {
       });
     }
 
-    if (tags) resume.tags = tags;
-    if (notes) resume.notes = notes;
+    // Check authorization (if user is authenticated)
+    if (req.user && resume.userId && resume.userId.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to update this resume'
+      });
+    }
+
+    if (tags !== undefined) resume.tags = tags;
+    if (notes !== undefined) resume.notes = notes;
 
     await resume.save();
 
-    res.json({
+    res.status(200).json({
       success: true,
       data: resume
     });
   } catch (error) {
-    console.error('Update resume error:', error);
+    console.error('Update resume error:', error.message);
+    
+    // Handle invalid ObjectId
+    if (error.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid resume ID format'
+      });
+    }
+
     res.status(500).json({
       success: false,
-      error: 'Failed to update resume'
+      error: 'Failed to update resume',
+      details: error.message
     });
   }
 };
